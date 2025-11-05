@@ -54,6 +54,11 @@ def add_user(user_id, referrer=None):
         cur.execute("INSERT INTO users(id, referrer) VALUES(?,?)", (user_id, referrer))
         conn.commit()
 
+        # 🎁 Auto Referral Bonus ₦30
+        if referrer:
+            cur.execute("UPDATE users SET balance = balance + 30 WHERE id=?", (referrer,))
+            conn.commit()
+
 
 def check_join(update):
     user_id = update.effective_user.id
@@ -166,7 +171,15 @@ def text_handler(update, context):
             acct = context.user_data["acct"]
             acct_name = context.user_data["acct_name"]
 
-            context.bot.send_message(PAYMENT_CHANNEL, f"💵 *Withdrawal Request*\n\nUser: `{user_id}`\nAmount: ₦{amt}\nBank: {bank}\nAccount: {acct}\nName: {acct_name}", parse_mode="Markdown")
+            # ✅ Approve / Reject Buttons
+            btns = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}_{amt}"),
+                 InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")]
+            ])
+
+            context.bot.send_message(PAYMENT_CHANNEL,
+                f"💵 *Withdrawal Request*\n\nUser: `{user_id}`\nAmount: ₦{amt}\nBank: {bank}\nAccount: {acct}\nName: {acct_name}",
+                reply_markup=btns, parse_mode="Markdown")
 
             update.message.reply_text("✅ Withdrawal requested. You will be paid in 20-30 minutes.")
             del context.user_data["withdraw_step"]
@@ -181,6 +194,19 @@ def button(update, context):
         task_id = data.split("_")[1]
         context.user_data["proof_task"] = task_id
         query.message.reply_text("📸 Send screenshot of task completed.")
+
+    elif data.startswith("approve_"):
+        _, uid, amt = data.split("_")
+        amt = int(amt)
+        cur.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amt, uid))
+        conn.commit()
+        context.bot.send_message(uid, f"✅ Your withdrawal of ₦{amt} has been approved and paid.")
+        query.message.edit_reply_markup(None)
+
+    elif data.startswith("reject_"):
+        _, uid = data.split("_")
+        context.bot.send_message(uid, "❌ Your withdrawal was rejected. Please contact admin.")
+        query.message.edit_reply_markup(None)
 
 
 def save_photo(update, context):
