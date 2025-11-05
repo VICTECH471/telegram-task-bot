@@ -1,144 +1,167 @@
-# Updated bot.py — generic join buttons + join-check + cooldown + adminpanel (inline)
+# bot.py (v20+ compatible)
+import os
 import logging
 import sqlite3
 import time
-from telegram import *
-from telegram.ext import *
-import datetime
+from typing import List, Tuple
 
-# ---------------- SETTINGS ---------------- #
-BOT_TOKEN = "8014945735:AAFtydPfTWK6qQD5z9WKuUEKD-QWvvGEXCU"
-ADMIN_ID = 8051564945
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ParseMode,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8014945735:AAFtydPfTWK6qQD5z9WKuUEKD-QWvvGEXCU"
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 8051564945)
 
 BOT_USERNAME = "CashgiveawayV1Bot"
 
-# Real channel usernames (kept here, but not shown to users)
+# real channel usernames (kept here but not shown to users)
 SPONSOR_CHANNEL = "@jeremyupdates"
 PROMOTER_CHANNELS = [
     "@SmartEarnOfficial",
     "@seyi_update",
     "@kingtupdate1",
-    "@ffx_updates"
+    "@ffx_updates",
 ]
 PAYMENT_CHANNEL = "@payment_channel001"
 
-# Display labels (what users see). Keep same length/order as actual lists.
+# display labels (users see these instead of real usernames)
 DISPLAY_SPONSOR = "⭐ Sponsor Channel"
-DISPLAY_PROMOTER_PREFIX = "📢 Promo Channel"
+DISPLAY_PROMO_PREFIX = "📢 Promo Channel"
 DISPLAY_PAYMENT = "💳 Payment Channel"
 
-REFERRAL_REWARD = 30  # ₦30 per invite
+REFERRAL_REWARD = 30
+MIN_WITHDRAW = 300
 JOIN_CHECK_COOLDOWN = 10  # seconds
-# ------------------------------------------- #
+# -----------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-conn = sqlite3.connect("bot.db", check_same_thread=False)
+# ---------------- DATABASE ----------------
+DB_FILE = "bot.db"
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 
-# DB schema (users table: id, balance, referrer). Keep as-is for compatibility.
-cur.execute("""CREATE TABLE IF NOT EXISTS users(
-id INTEGER PRIMARY KEY,
-balance INTEGER DEFAULT 0,
-referrer INTEGER)""")
-
-cur.execute("""CREATE TABLE IF NOT EXISTS tasks(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-title TEXT,
-price INTEGER,
-link TEXT)""")
-
-cur.execute("""CREATE TABLE IF NOT EXISTS proofs(
-user_id INTEGER,
-task_id INTEGER)""")
-
+cur.execute(
+    """CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY,
+        balance REAL DEFAULT 0,
+        referrer INTEGER
+    )"""
+)
+cur.execute(
+    """CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        price REAL,
+        link TEXT
+    )"""
+)
+cur.execute(
+    """CREATE TABLE IF NOT EXISTS proofs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        task_id INTEGER,
+        timestamp INTEGER
+    )"""
+)
 conn.commit()
 
-# in-memory cooldown store for join checks {user_id: last_check_ts}
-join_cooldowns = {}
 
-# ---------- helper DB functions ----------
-def user_exists(uid):
+# ---------- helper DB funcs ----------
+def user_exists(uid: int) -> bool:
     cur.execute("SELECT 1 FROM users WHERE id=?", (uid,))
     return cur.fetchone() is not None
 
-def add_user(uid, ref=None, username=None, first_name=None):
-    """Add user; if ref present credit inviter and announce to payment channel."""
+
+def add_user_db(uid: int, ref: int | None):
     if not user_exists(uid):
-        # insert with referrer in the referrer column
         cur.execute("INSERT INTO users(id, referrer) VALUES(?,?)", (uid, ref))
         conn.commit()
-
-        # credit referral reward to inviter
-        if ref:
+        # credit referrer if present
+        if ref and user_exists(ref):
+            cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (REFERRAL_REWARD, ref))
+            conn.commit()
             try:
-                cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (REFERRAL_REWARD, ref))
-                conn.commit()
-                # notify inviter (best-effort)
-                try:
-                    updater.bot.send_message(int(ref), f"🎉 You earned ₦{REFERRAL_REWARD} for inviting @{username or first_name or ref}!")
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.info("Referral credit failed: %s", e)
+                application.bot.send_message(
+                    chat_id=int(ref),
+                    text=f"🎉 You earned ₦{REFERRAL_REWARD} for inviting a new user!"
+                )
+            except Exception:
+                logger.info("Could not notify referrer %s", ref)
 
-        # announce new user to payment channel (use username if available)
-        try:
-            uname = username if username else (first_name if first_name else str(uid))
-            text = (
-                f"👤 *New User Joined*\n\n"
-                f"Username: @{uname}\n"
-                f"Referral: {'✅ Yes' if ref else '❌ No'}"
-            )
-            updater.bot.send_message(PAYMENT_CHANNEL, text, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.info("Could not announce new user: %s", e)
 
-# ---------- join check logic ----------
-def build_channel_role_lists():
-    """Return parallel lists: roles_display, channel_usernames (strings)."""
-    channel_usernames = [SPONSOR_CHANNEL] + PROMOTER_CHANNELS + [PAYMENT_CHANNEL]
-    roles_display = [DISPLAY_SPONSOR]
-    # promoters labeled Promo 1...N
-    for i in range(len(PROMOTER_CHANNELS)):
-        roles_display.append(f"{DISPLAY_PROMOTER_PREFIX} {i+1}")
-    roles_display.append(DISPLAY_PAYMENT)
-    return roles_display, channel_usernames
+def ensure_user_record(uid: int):
+    if not user_exists(uid):
+        add_user_db(uid, None)
 
-def check_join_roles_for_user(uid):
-    """
-    Returns list of role labels that are missing for the user.
-    e.g. ["⭐ Sponsor Channel", "📢 Promo Channel 2"]
-    If the bot cannot access a channel (private / not member), treat it as missing and include the role.
-    """
-    roles_display, channel_usernames = build_channel_role_lists()
-    missing_roles = []
-    for role_label, ch in zip(roles_display, channel_usernames):
-        try:
-            member = updater.bot.get_chat_member(chat_id=ch, user_id=uid)
-            if member.status in ("left", "kicked"):
-                missing_roles.append(role_label)
-        except Exception as e:
-            # If bot cannot access or channel private and bot not inside, count as missing role.
-            logger.info("check_join: could not check %s for %s -> %s", ch, uid, e)
-            missing_roles.append(role_label)
-    return missing_roles
 
-def build_join_keyboard():
-    """Return InlineKeyboardMarkup with generic role-labeled buttons linking to real channels + I Have Joined button."""
-    roles_display, channel_usernames = build_channel_role_lists()
+# ---------- channel role helpers ----------
+def build_roles_and_channels() -> Tuple[List[str], List[str]]:
+    """Return parallel lists: role labels and real usernames."""
+    channels = [SPONSOR_CHANNEL] + PROMOTER_CHANNELS + [PAYMENT_CHANNEL]
+    roles = [DISPLAY_SPONSOR] + [f"{DISPLAY_PROMO_PREFIX} {i+1}" for i in range(len(PROMOTER_CHANNELS))] + [DISPLAY_PAYMENT]
+    return roles, channels
+
+
+def build_join_keyboard() -> InlineKeyboardMarkup:
+    roles, channels = build_roles_and_channels()
     buttons = []
-    for role_label, ch in zip(roles_display, channel_usernames):
-        # create a public t.me link to the username (works for public channels)
+    for role, ch in zip(roles, channels):
         link = f"https://t.me/{ch.lstrip('@')}"
-        buttons.append([InlineKeyboardButton(role_label, url=link)])
-    # final row: I Have Joined
+        buttons.append([InlineKeyboardButton(role, url=link)])
     buttons.append([InlineKeyboardButton("✅ I Have Joined", callback_data="check_joined")])
     return InlineKeyboardMarkup(buttons)
 
-# ---------- handlers ----------
-def start(update: Update, context: CallbackContext):
+
+async def check_missing_roles_for_user(application: Application, uid: int) -> List[str]:
+    roles, channels = build_roles_and_channels()
+    missing = []
+    for role, ch in zip(roles, channels):
+        try:
+            member = await application.bot.get_chat_member(chat_id=ch, user_id=uid)
+            if member.status in ("left", "kicked"):
+                missing.append(role)
+        except Exception as e:
+            # cannot access (bot not in channel or private) -> treat as missing
+            logger.info("Check failed for %s, user %s: %s", ch, uid, e)
+            missing.append(role)
+    return missing
+
+
+# ---------- in-memory cooldown ----------
+join_cooldowns: dict[int, float] = {}
+
+
+# ---------- utilities ----------
+def get_display_for_user_sync(uid: int) -> str:
+    """Synchronous fallback to create a display string from DB or id."""
+    try:
+        cur.execute("SELECT id FROM users WHERE id=?", (uid,))
+        if cur.fetchone():
+            # we will try to get username via bot if needed in async handlers
+            return str(uid)
+    except Exception:
+        pass
+    return str(uid)
+
+
+# ---------- Handlers ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id
     args = context.args
@@ -146,181 +169,222 @@ def start(update: Update, context: CallbackContext):
     if args:
         try:
             ref = int(args[0])
-        except:
+        except Exception:
             ref = None
-    # Save user (attempt to use username)
-    add_user(uid, ref=ref, username=user.username, first_name=user.first_name)
 
-    # Show join menu if not joined
-    missing = check_join_roles_for_user(uid)
+    # store user and credit referrer if new
+    add_user_db(uid, ref)
+
+    # announce new user to payment channel (async)
+    try:
+        uname = f"@{user.username}" if user.username else (user.first_name or str(uid))
+        await context.bot.send_message(
+            chat_id=PAYMENT_CHANNEL,
+            text=f"👤 *New User Joined*\n\nUsername: {uname}\nReferral: {'✅ Yes' if ref else '❌ No'}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.info("Could not announce new user to payment channel: %s", e)
+
+    # check joins
+    missing = await check_missing_roles_for_user(context.application, uid)
     if missing:
         text = (
             "🚨 *Before continuing, please join our required channels:*\n\n"
             "You will see buttons below that open each channel. Join them, then press *I Have Joined*.\n\n"
-            "If the bot isn't added to a channel as admin/member it may not be able to verify — contact admin in that case."
+            "If the bot is not added to a channel (private / not member), it cannot verify automatically — contact admin."
         )
-        update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_join_keyboard())
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=build_join_keyboard())
         return
 
-    # already joined all — show main menu
-    show_main_menu(update, context)
+    # all joined -> show menu
+    await show_main_menu(update, context)
 
-def show_main_menu(update: Update, context: CallbackContext):
-    user = update.effective_user
-    uid = user.id
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # support both message and callback contexts
     keyboard = [
         [KeyboardButton("🧾 Earn Tasks"), KeyboardButton("💰 Balance")],
         [KeyboardButton("👥 Referrals"), KeyboardButton("💵 Withdraw")]
     ]
-    update.message.reply_text("🏠 *Dashboard*", parse_mode=ParseMode.MARKDOWN, reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    if update.effective_user.id == ADMIN_ID:
+        keyboard.append([KeyboardButton("⚙ Admin Panel")])
+    text = "🏠 *Dashboard*"
+    # if callback query present, edit or send accordingly
+    # easiest is to reply a new message:
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=ParseMode.MARKDOWN,
+                                   reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
-def check_joined_callback(update: Update, context: CallbackContext):
-    """Callback when user taps 'I Have Joined' — performs cooldown and checks roles"""
+
+async def cb_check_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = query.from_user.id
     now = time.time()
     last = join_cooldowns.get(uid, 0)
     if now - last < JOIN_CHECK_COOLDOWN:
         remaining = int(JOIN_CHECK_COOLDOWN - (now - last))
-        # use alert popup so chat not spammed
-        return query.answer(f"⏳ Please wait {remaining}s before checking again.", show_alert=True)
-    # update cooldown
+        await query.answer(f"⏳ Please wait {remaining}s before checking again.", show_alert=True)
+        return
     join_cooldowns[uid] = now
 
-    missing = check_join_roles_for_user(uid)
+    missing = await check_missing_roles_for_user(context.application, uid)
     if not missing:
         try:
-            # remove the join message and greet user
-            query.message.delete()
+            await query.message.delete()
         except Exception:
             pass
-        try:
-            query.answer("✅ Verified — you joined all required channels!", show_alert=False)
-        except:
-            pass
-        # Show dashboard
-        # Build a fake Update message to call show_main_menu uniformly
-        try:
-            show_main_menu(update, context)
-        except Exception:
-            pass
+        await query.answer("✅ Verified — you joined all required channels!")
+        # show menu
+        await show_main_menu(update, context)
     else:
-        # Build response listing missing *role labels* (no usernames revealed)
-        text = "❌ You have not joined all required channels yet.\n\nMissing:\n" + "\n".join(f"• {r}" for r in missing) + "\n\nOpen the missing channels (buttons above) and join, then press I Have Joined again."
-        # Build keyboard showing only missing buttons + I Have Joined
-        # Map missing labels back to the corresponding channel url rows
-        roles_display, channel_usernames = build_channel_role_lists()
+        text = "❌ You have not joined all required channels yet.\n\nMissing:\n"
+        text += "\n".join(f"• {r}" for r in missing)
+        text += "\n\nOpen the missing channels from the buttons and press I Have Joined again."
+        # build keyboard only for missing
+        roles, channels = build_roles_and_channels()
         buttons = []
-        for role_label, ch in zip(roles_display, channel_usernames):
-            if role_label in missing:
-                buttons.append([InlineKeyboardButton(role_label, url=f"https://t.me/{ch.lstrip('@')}")])
+        for role, ch in zip(roles, channels):
+            if role in missing:
+                buttons.append([InlineKeyboardButton(role, url=f"https://t.me/{ch.lstrip('@')}")])
         buttons.append([InlineKeyboardButton("✅ I Have Joined", callback_data="check_joined")])
-        try:
-            query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
-        except:
-            try:
-                query.answer("❌ You have not joined all required channels.", show_alert=True)
-            except:
-                pass
+        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        await query.answer()
 
-def text_handler(update: Update, context: CallbackContext):
-    msg = update.message.text
+
+async def show_join_page_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # helper on any message to enforce join requirement
+    uid = update.effective_user.id
+    missing = await check_missing_roles_for_user(context.application, uid)
+    if missing:
+        await update.message.reply_text("🚨 You must join required channels first.", reply_markup=build_join_keyboard())
+        return True
+    return False
+
+
+async def msg_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
     uid = update.effective_user.id
 
-    # require join on all menu actions
-    missing = check_join_roles_for_user(uid)
+    # ensure user record
+    ensure_user_record(uid)
+
+    # enforce join
+    missing = await check_missing_roles_for_user(context.application, uid)
     if missing:
-        update.message.reply_text("🚨 You must join required channels first.", reply_markup=build_join_keyboard())
+        await update.message.reply_text("🚨 You must join required channels first.", reply_markup=build_join_keyboard())
         return
 
-    # existing menu functionality
-    if msg == "💰 Balance":
+    if text == "💰 Balance":
         cur.execute("SELECT balance FROM users WHERE id=?", (uid,))
         row = cur.fetchone()
         bal = row[0] if row else 0
-        update.message.reply_text(f"💳 Your Balance: *₦{bal}*", parse_mode=ParseMode.MARKDOWN)
-    elif msg == "👥 Referrals":
+        await update.message.reply_text(f"💳 Your Balance: *₦{bal}*", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if text == "👥 Referrals":
         cur.execute("SELECT COUNT(*) FROM users WHERE referrer=?", (uid,))
         count = cur.fetchone()[0]
         link = f"https://t.me/{BOT_USERNAME}?start={uid}"
-        # also show invite count (same as count)
-        cur.execute("SELECT balance FROM users WHERE id=?", (uid,))
-        row = cur.fetchone()
-        bal = row[0] if row else 0
-        update.message.reply_text(f"👤 Referrals: {count}\n👥 Invite Count: {count}\n\n🔗 Referral Link:\n{link}\n\n💰 Balance: ₦{bal}", parse_mode=ParseMode.MARKDOWN)
-    elif msg == "🧾 Earn Tasks":
+        await update.message.reply_text(f"👤 Referrals: {count}\n\n🔗 Referral Link:\n{link}")
+        return
+
+    if text == "🧾 Earn Tasks":
         cur.execute("SELECT id, title, price, link FROM tasks")
         tasks = cur.fetchall()
         if not tasks:
-            update.message.reply_text("No tasks available now.")
+            await update.message.reply_text("No tasks available now.")
             return
         for t in tasks:
-            btn = [[InlineKeyboardButton("✅ Submit Proof", callback_data=f"proof_{t[0]}")]]
-            update.message.reply_text(f"📌 *{t[1]}*\n💰 Reward: ₦{t[2]}\n🔗 {t[3]}", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btn))
-    elif msg == "💵 Withdraw":
-        update.message.reply_text("Enter amount to withdraw (min ₦300):")
+            btn = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Submit Proof", callback_data=f"proof_{t[0]}")]])
+            await update.message.reply_text(f"📌 *{t[1]}*\n💰 Reward: ₦{t[2]}\n🔗 {t[3]}",
+                                            parse_mode=ParseMode.MARKDOWN, reply_markup=btn)
+        return
+
+    if text == "💵 Withdraw":
+        await update.message.reply_text(f"Enter amount to withdraw (min ₦{MIN_WITHDRAW}):")
         context.user_data["wd"] = True
-    elif msg == "⚙ Admin Panel":
-        # keep legacy; admin uses /adminpanel command
-        update.message.reply_text("Use /adminpanel to open the admin dashboard (admin only).")
-    elif msg.isdigit() and "wd" in context.user_data:
-        amt = int(msg)
+        return
+
+    if text == "⚙ Admin Panel":
+        await update.message.reply_text("Use /adminpanel (admin only).")
+        return
+
+    # admin message commands handled elsewhere; but allow /adminpanel call handling by command handler
+
+    # if withdrawing steps
+    if "wd" in context.user_data and text.isdigit():
+        amt = int(text)
         cur.execute("SELECT balance FROM users WHERE id=?", (uid,))
         row = cur.fetchone()
         bal = row[0] if row else 0
-        if amt < 300 or amt > bal:
-            update.message.reply_text("❌ Invalid amount.")
-        else:
-            context.user_data["amount"] = amt
-            update.message.reply_text("Enter Bank Name:")
-            context.user_data["step"] = 1
-    elif "step" in context.user_data:
-        step = context.user_data["step"]
-        if step == 1:
-            context.user_data["bank"] = msg
-            update.message.reply_text("Enter Account Number:")
-            context.user_data["step"] = 2
-        elif step == 2:
-            context.user_data["acct"] = msg
-            update.message.reply_text("Enter Account Name:")
-            context.user_data["step"] = 3
-        elif step == 3:
-            context.user_data["acct_name"] = msg
-            withdraw_request(update, context)
-    else:
-        # fallback
-        update.message.reply_text("Use the menu. Send /start to show the join page.")
-
-# ---------- withdraw & approve/reject ----------
-def withdraw_request(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    amt = context.user_data["amount"]
-    bank = context.user_data["bank"]
-    acct = context.user_data["acct"]
-    name = context.user_data["acct_name"]
-
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}_{amt}"),
-         InlineKeyboardButton("❌ Reject", callback_data=f"reject_{uid}")]
-    ])
-
-    text = f"💵 *Withdrawal Request*\n\nUser: `{get_display_for_user(uid)}`\nAmount: ₦{amt}\nBank: {bank}\nAccount: {acct}\nName: {name}"
-    try:
-        updater.bot.send_message(PAYMENT_CHANNEL, text, parse_mode=ParseMode.MARKDOWN, reply_markup=btn)
-    except Exception as e:
-        logger.info("Could not send withdrawal to payment channel: %s", e)
-        update.message.reply_text("Could not send to payment channel. Contact admin.")
+        if amt < MIN_WITHDRAW or amt > bal:
+            await update.message.reply_text("❌ Invalid amount.")
+            return
+        context.user_data["amount"] = amt
+        await update.message.reply_text("Enter Bank Name:")
+        context.user_data["step"] = 1
         return
 
-    update.message.reply_text("✅ Withdrawal submitted! Paid within 20-30 minutes.")
-    # clean up
-    del context.user_data["step"]
-    del context.user_data["wd"]
+    if "step" in context.user_data:
+        step = context.user_data["step"]
+        if step == 1:
+            context.user_data["bank"] = text
+            context.user_data["step"] = 2
+            await update.message.reply_text("Enter Account Number:")
+            return
+        if step == 2:
+            context.user_data["acct"] = text
+            context.user_data["step"] = 3
+            await update.message.reply_text("Enter Account Name:")
+            return
+        if step == 3:
+            context.user_data["acct_name"] = text
+            await process_withdraw_request(update, context)
+            return
 
-def get_display_for_user(uid):
-    """Return best display name for user: @username or numeric id."""
+    # fallback
+    await update.message.reply_text("Use the menu or /start. ")
+
+# ---------- withdraw flow ----------
+async def process_withdraw_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    amt = context.user_data.get("amount")
+    bank = context.user_data.get("bank")
+    acct = context.user_data.get("acct")
+    name = context.user_data.get("acct_name")
+
+    # post to payment channel with approve reject
+    text = (
+        f"💵 *Withdrawal Request*\n\n"
+        f"User: `{await get_display_for_user(uid, context)}`\n"
+        f"Amount: ₦{amt}\n"
+        f"Bank: {bank}\n"
+        f"Account: {acct}\n"
+        f"Name: {name}"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}_{amt}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject_{uid}")
+    ]])
     try:
-        user = updater.bot.get_chat(uid)
+        await context.bot.send_message(chat_id=PAYMENT_CHANNEL, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except Exception as e:
+        logger.info("Could not send withdraw to payment channel: %s", e)
+        await update.message.reply_text("Could not send withdraw request to payment channel. Contact admin.")
+        return
+
+    await update.message.reply_text("✅ Withdrawal submitted! You will be paid in 20-30 minutes.")
+    context.user_data.pop("step", None)
+    context.user_data.pop("wd", None)
+    context.user_data.pop("amount", None)
+    context.user_data.pop("bank", None)
+    context.user_data.pop("acct", None)
+    context.user_data.pop("acct_name", None)
+
+
+async def get_display_for_user(uid: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    try:
+        user = await context.bot.get_chat(uid)
         if user.username:
             return f"@{user.username}"
         if user.first_name:
@@ -329,150 +393,135 @@ def get_display_for_user(uid):
         pass
     return str(uid)
 
-# ---------- admin panel (inline) ----------
-def adminpanel_command(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    if uid != ADMIN_ID:
-        return update.message.reply_text("❌ You are not authorized.")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Task", callback_data="admin_addtask"),
-         InlineKeyboardButton("💰 Add Balance", callback_data="admin_addbal")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-         InlineKeyboardButton("🎁 Set Referral Reward", callback_data="admin_setref")],
-        [InlineKeyboardButton("🔧 Manage Channels", callback_data="admin_channels"),
-         InlineKeyboardButton("🏧 Withdrawals", callback_data="admin_withdraws")],
-        [InlineKeyboardButton("🔙 Close", callback_data="admin_close")]
-    ])
-    update.message.reply_text("⚙️ *ADMIN PANEL*\nChoose an action:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
-def admin_callback_handler(update: Update, context: CallbackContext):
+# ---------- proof/photo handler ----------
+async def cb_proof_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    uid = query.from_user.id
-    if uid != ADMIN_ID:
-        return query.answer("Not authorized", show_alert=True)
+    await query.answer()
     data = query.data
-
-    if data == "admin_addtask":
-        query.answer()
-        query.message.reply_text("To add a task, send this command in chat:\n\n/addtask title|price|link\n\nExample:\n/addtask Like post|50|https://t.me/...")
-    elif data == "admin_addbal":
-        query.answer()
-        query.message.reply_text("To add balance manually:\n\n/addbal <user_id> <amount>\nExample:\n/addbal 123456789 500")
-    elif data == "admin_broadcast":
-        query.answer()
-        query.message.reply_text("To broadcast to all users use:\n\n/broadcast Your message here")
-    elif data == "admin_setref":
-        query.answer()
-        query.message.reply_text("To set referral reward use:\n\n/setref <amount>\nExample:\n/setref 30")
-    elif data == "admin_channels":
-        query.answer()
-        query.message.reply_text("To add/remove must-join channels use:\n\n/addchannel @channel_username\n/rmchannel @channel_username")
-    elif data == "admin_withdraws":
-        query.answer()
-        query.message.reply_text("Withdrawal requests appear in the Payment Channel. Approve/Reject by clicking buttons in that channel.")
-    elif data == "admin_close":
-        query.answer()
-        try:
-            query.message.delete()
-        except:
-            pass
-
-# ---------- button callback router ----------
-def generic_callback_router(update: Update, context: CallbackContext):
-    query = update.callback_query
-    data = query.data
-    uid = query.from_user.id
-
-    # check_joined handler
-    if data == "check_joined":
-        return check_joined_callback(update, context)
-
-    # admin inline panel actions
-    if data.startswith("admin_"):
-        return admin_callback_handler(update, context)
-
-    # approve/reject withdrawal (admin only)
-    if data.startswith("approve_") and uid == ADMIN_ID:
-        try:
-            _, u, amt = data.split("_")
-            amt = float(amt)
-            # deduct from user is already reserved or not? We will deduct now
-            cur.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amt, int(u)))
-            conn.commit()
-            try:
-                updater.bot.send_message(int(u), f"✅ Your withdrawal of ₦{amt} has been approved and marked as paid.")
-            except Exception:
-                pass
-            try:
-                query.message.edit_reply_markup(None)
-            except:
-                pass
-            query.answer("Approved")
-        except Exception as e:
-            logger.info("Approve failed: %s", e)
-            query.answer("Error approving", show_alert=True)
-        return
-
-    if data.startswith("reject_") and uid == ADMIN_ID:
-        try:
-            _, u = data.split("_")
-            # Optionally: refund? current flow didn't deduct yet; if you deducted earlier, refund here.
-            try:
-                updater.bot.send_message(int(u), "❌ Your withdrawal was rejected. Please contact admin.")
-            except:
-                pass
-            try:
-                query.message.edit_reply_markup(None)
-            except:
-                pass
-            query.answer("Rejected")
-        except Exception as e:
-            logger.info("Reject failed: %s", e)
-            query.answer("Error rejecting", show_alert=True)
-        return
-
-    # proof submission callback: set pending proof_task for user
     if data.startswith("proof_"):
         try:
             task_id = int(data.split("_", 1)[1])
             context.user_data["proof_task"] = task_id
-            query.message.reply_text("📸 Send screenshot of task completed now.")
-            query.answer()
+            await query.message.reply_text("📸 Send screenshot/photo of the task now.")
         except Exception as e:
             logger.info("proof callback error: %s", e)
-            query.answer("Error", show_alert=True)
+            await query.message.reply_text("Error processing proof request.")
 
-# ---------- photo handler (proof upload) ----------
-def save_photo(update: Update, context: CallbackContext):
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if "proof_task" not in context.user_data:
-        update.message.reply_text("First click Submit Proof on a task.")
+        await update.message.reply_text("First click Submit Proof on a task.")
         return
-    task = context.user_data["proof_task"]
-
-    # one-time check
-    cur.execute("SELECT 1 FROM proofs WHERE user_id=? AND task_id=?", (uid, task))
+    task_id = context.user_data["proof_task"]
+    # ensure not already submitted
+    cur.execute("SELECT 1 FROM proofs WHERE user_id=? AND task_id=?", (uid, task_id))
     if cur.fetchone():
-        update.message.reply_text("❌ You already submitted this task.")
-        del context.user_data["proof_task"]
+        await update.message.reply_text("❌ You already submitted this task.")
+        context.user_data.pop("proof_task", None)
         return
 
-    # save proof record
-    cur.execute("INSERT INTO proofs(user_id, task_id) VALUES(?,?)", (uid, task))
+    # store proof record
+    ts = int(time.time())
+    cur.execute("INSERT INTO proofs(user_id, task_id, timestamp) VALUES(?,?,?)", (uid, task_id, ts))
     conn.commit()
 
-    # credit reward instantly (you may want admin approval instead — change here if needed)
-    cur.execute("SELECT price FROM tasks WHERE id=?", (task,))
+    # credit instantly (if desired) — currently instant credit
+    cur.execute("SELECT price FROM tasks WHERE id=?", (task_id,))
     row = cur.fetchone()
     price = row[0] if row else 0
     cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (price, uid))
     conn.commit()
 
-    # forward photo to payment channel for admin visibility
+    # forward proof to payment channel
     try:
-        caption = f"✅ Task Proof Submitted\nUser: {get_display_for_user(uid)}\nTask ID: {task}\nReward: ₦{price}"
-        updater.bot.send_photo(chat_id=PAYMENT_CHANNEL, photo=update.message.photo[-1].file_id, caption=caption)
+        caption = f"✅ Task Proof Submitted\nUser: {await get_display_for_user(uid, context)}\nTask ID: {task_id}\nReward: ₦{price}"
+        file_id = update.message.photo[-1].file_id if update.message.photo else None
+        if file_id:
+            await context.bot.send_photo(chat_id=PAYMENT_CHANNEL, photo=file_id, caption=caption)
+        else:
+            await context.bot.send_message(chat_id=PAYMENT_CHANNEL, text=caption)
     except Exception as e:
-        logger.info("Failed to forward proof: %s", e)
+        logger.info("Could not forward proof: %s", e)
 
-    update.message.reply_text(f"✅ Proof received. You earned ₦{price}. (Admin will verify in paymen
+    await update.message.reply_text(f"✅ Proof received. You earned ₦{price}.")
+    context.user_data.pop("proof_task", None)
+
+
+# ---------- admin panel & admin commands ----------
+async def cmd_adminpanel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use admin panel.")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Task", callback_data="admin_addtask"),
+         InlineKeyboardButton("💰 Add Balance", callback_data="admin_addbal")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton("🎁 Set Referral", callback_data="admin_setref")],
+        [InlineKeyboardButton("🔧 Manage Channels", callback_data="admin_channels"),
+         InlineKeyboardButton("🏧 Withdrawals", callback_data="admin_withdraws")],
+        [InlineKeyboardButton("🔙 Close", callback_data="admin_close")]
+    ])
+    await update.message.reply_text("⚙️ *ADMIN PANEL*\nChoose an action:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def admin_inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    if uid != ADMIN_ID:
+        await query.answer("Not authorized", show_alert=True)
+        return
+    d = query.data
+
+    if d == "admin_addtask":
+        await query.message.reply_text("To add a task use:\n/addtask title|price|link")
+    elif d == "admin_addbal":
+        await query.message.reply_text("To add balance use:\n/addbal <user_id> <amount>")
+    elif d == "admin_broadcast":
+        await query.message.reply_text("To broadcast use:\n/broadcast Your message here")
+    elif d == "admin_setref":
+        await query.message.reply_text("To set referral reward:\n/setref <amount>")
+    elif d == "admin_channels":
+        await query.message.reply_text("Use /addchannel @username and /rmchannel @username to manage channels")
+    elif d == "admin_withdraws":
+        await query.message.reply_text("Withdraw requests arrive in the payment channel; approve/reject there.")
+    elif d == "admin_close":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+
+async def admin_text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        return
+    text = update.message.text.strip()
+    # /addtask title|price|link
+    if text.startswith("/addtask "):
+        try:
+            _, payload = text.split(" ", 1)
+            title, price, link = payload.split("|")
+            cur.execute("INSERT INTO tasks(title, price, link) VALUES(?,?,?)", (title.strip(), float(price), link.strip()))
+            conn.commit()
+            await update.message.reply_text("✅ Task added.")
+        except Exception as e:
+            logger.info("addtask err: %s", e)
+            await update.message.reply_text("Usage: /addtask title|price|link")
+    elif text.startswith("/addbal "):
+        try:
+            _, uid_str, amt = text.split(" ", 2)
+            cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (float(amt), int(uid_str)))
+            conn.commit()
+            await update.message.reply_text("✅ Balance added.")
+        except Exception as e:
+            logger.info("addbal err: %s", e)
+            await update.message.reply_text("Usage: /addbal user_id amount")
+    elif text.startswith("/broadcast "):
+        try:
+            msg = text.split(" ", 1)[1]
+            cur.execute("SELECT id FROM users")
+            rows = 
